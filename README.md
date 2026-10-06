@@ -1,0 +1,181 @@
+# AgriHeat —— 玉米积温与生育期预测服务
+
+给县农技站合作社小程序调用的后端：接收几十个自动气象站的每日最高/最低气温，
+按品种基点温度、上限温度和各生育阶段积温需求，逐地块累加日积温（GDD），
+预测出苗、拔节、抽雄、吐丝、成熟日期，并在数据补传、更正、改绑时**增量更新**，
+结果与"只拿最终数据从播种日全量重算"逐日一致。
+
+Go 1.22 + Gin + PostgreSQL 16。
+
+## 运行
+
+```bash
+docker compose up --build
+# API: http://localhost:8080
+```
+
+首次启动自动建表（`internal/store/schema.sql`，幂等）。
+
+## 测试
+
+```bash
+# 纯逻辑测试（无需数据库）：覆盖积温口径、基点单调性、乱序/重复上报、
+# 补值替换、改绑、大量随机更正序列下增量==全量、任务合并、重启续跑
+go test ./...
+
+# PostgreSQL 集成测试（需先 docker compose up db）：
+#   并发同站同日上报只保留最大 seq、FOR UPDATE SKIP LOCKED 领任务、
+#   HTTP 端到端（批量非法行、阶段、曲线、事件、改绑校验）
+TEST_DATABASE_URL=postgres://agri:agri@localhost:5432/agriheat?sslmode=disable \
+    go test -tags=integration ./...
+```
+
+## 日积温口径
+
+`internal/gdd` 提供三种：
+
+| 方法 | 公式 |
+| --- | --- |
+| `sine`（默认） | 单正弦 + 水平截断（Baskerville–Emin / UC IPM 口径） |
+| `triangle` | 三角折线 + 基点/上限截断 |
+| `mean` | `(Tmax+Tmin)/2 − base`，下限取 0 |
+
+**默认选正弦截断法的理由**：玉米生育期里春秋季常见"最低温低于基点、午后却明显
+回暖"的日子。平均法在这类日子会整天记 0（当 `(Tx+Tn)/2 < base`），系统性低估；
+正弦法用半日波近似真实温度过程，只对基点以下、上限以上的部分截断，在低温季
+更接近实测热量积累；它同时考虑上限截顶（高温胁迫时不继续积温），是玉米积温
+指导中使用最广的口径。三角法实现更简单但折线过尖，作为可切换的备选保留。
+
+**和平均法在哪些天差得多**：
+
+1. **最低温低于基点但最高温较高**的日子（如基点 10 ℃，Tx 18 / Tn 2）：
+   平均法 `(18+2)/2−10=0`；正弦法对午后高于 10 ℃ 的时段积分，得正值。
+2. **最高温超过上限**的盛夏午后：正弦法截到上限，平均法不截顶，差为"热害虚高"部分。
+3. 两极端都在 `[base, ceiling]` 内时，三种口径**完全相等**。
+
+所有口径满足题设不变量（见 `internal/gdd/gdd_test.go`）：
+
+* Tx、Tn 都在基点与上限之间时，GDD = 平均温度 − 基点
+  （基点 10，Tx 30，Tn 14 → **12**）；
+* `Tmax ≤ base` 时为 0；任何一天不为负；
+* 基点调高，任一日 GDD 不增（网格扫描验证），因此各阶段日期只推迟或不变。
+
+正弦闭式解（波 `W(u)=m+b·cos u`，`m=(Tx+Tn)/2`，`b=(Tx−Tn)/2`）：
+
+```
+mean(clip[base,ceil](W)) = m − b·f(αc) + b·f(αb)
+GDD                      = 上式 − base
+αc = (ceil−m)/b,  αb = (m−base)/b
+f(c) = (1/2π)·∫max(cos u − c, 0)du
+     = [2·sin(arccos c) − 2c·arccos c] / 2π     (−1 < c < 1)
+```
+
+## 缺测补值
+
+`internal/climate`，优先级（见包注释）：
+
+1. **本站历年同日气候平均**：以日序为中心 ±5 天环形窗口、至少 3 个样本（只取真实
+   观测，补值永不回灌气候态，避免自污染），标 `fill_station`；
+2. 否则用**邻站同日观测**，0.65 ℃/100 m 海拔递减率订正 + 反距离平方加权（200 km 内），
+   标 `fill_neighbor`，并记录所依据的观测行（basis）；
+3. 否则用邻站的同日气候平均做同样订正；
+4. 都没有则当天不产热量，等真实数据到达。
+
+**理由**：本站同地气候平均是无偏估计且无需元数据，故优先；邻站法在新建站
+（历史不足）时兜底，海拔订正是山区县必需的修正，距离权重比最近邻更稳。
+补值写入 `weather` 表但带 source 标记；真实观测到达时 `UpsertObs` 总是覆盖补值
+（观测 basis 变化会级联删除依赖它的邻站补值），下一次重算自动替换。
+
+**过去 vs 未来**：已过去的日子用观测或补值；未来的日子只做气候态外推（不落库、
+标记 `climate`），外推上限 366 天。阶段结果注明 `reached`（已达到，给实际日期）
+或 `forecast`（预计）。
+
+## 增量重算与快照（核心一致性方案）
+
+`internal/engine`。每次变化产生一个持久任务（地块、asOf、最早受影响日 Start、
+change_id），worker 领取后：
+
+1. 取 **Start 之前最新的月末快照**（没有则回退到播种日前一天、累计 0）；
+2. 从快照次日起逐日重算到 asOf（过去段）+ 气候外推到成熟或 horizon（未来段），
+   沿途只重建**经过的月末快照**，并重写该窗口的逐日曲线；
+3. 新阶段向量与旧向量 diff，变化才写事件（事件带 `change_id` 唯一键，幂等去重）。
+
+**快照粒度的权衡**：月末检查点。每日快照在更正季（几十个站 × 多月）空间膨胀明显，
+且事件多发生在播种后数月，按日回退没有收益；月末粒度把单次重算上界压到约一个月
+（≤31 天），存储每地块每年仅 12 行。播种日全量重算成本为 O(生育期天数)，月未
+快照后更正成本为 O(距上个月末天数 + 外推天数)。
+
+**为什么任意乱序/补传/更正后都等于全量重算**：
+
+* 观测以"同站同日 seq 最大者胜"写入，晚到的小 seq 一律不覆盖，最终表只取决于
+  收到过的最大 seq，与到达顺序无关；
+* 更正日 d 的任务 Start=d，回退到 d 之前的快照，而快照在全量口径下本身就是
+  "播种到该日的累计"；从同一快照、同一最终日数据走同一套逐日函数，必然与从头
+  全量逐日相同（纯函数 `phenology`/`gdd` 只有一份实现，另有独立 oracle 做随机对拍）；
+* 补值随观测到达而失效重算；改绑从生效日起重算，绑定是日期→站点的纯函数；
+* `internal/engine/engine_test.go` 的 `TestRandomCorrections` 用 40 组随机乱序/
+  补传/更正序列，每组结束都与独立全量 oracle **逐日**比较。
+
+## 并发、崩溃与事件
+
+* **并发上报**：`stations` 行级锁 `SELECT … FOR UPDATE` 串行化同站写入；同批内
+  同站同日先按 seq 折叠；两批并发时各自事务拿锁后重读当前 seq，小 seq 忽略，
+  最终只有一条权威行。同一地块待处理任务在入队时 `EnqueueOrMergeTask` 合并
+  （取最早 Start、最晚 asOf），配合 worker 的 `FOR UPDATE SKIP LOCKED`，一次数据
+  变化地块只重算一次。
+* **重启续跑**：任务表持久化；进行中(processing)任务在启动时 `RecoverProcessing`
+  重置为 pending；事件唯一键 + 快照 upsert 使重跑幂等，结果与未中断一致。
+* **事件**：`stage_events(plot_id, stage, change_id)` 唯一；每次阶段日期变化记
+  旧日期、新日期、触发原因（哪站哪天的数据变了/改绑）；同一次变化不产生重复。
+  `GET /api/v1/events?after_id=&limit=` 按 id 增量拉取供小程序推送。
+
+## 接口
+
+| 方法/路径 | 说明 |
+| --- | --- |
+| `POST /api/v1/stations` | 登记气象站（经纬度、海拔） |
+| `POST /api/v1/varieties` | 登记品种（基点、上限、五阶段累计需求） |
+| `POST /api/v1/plots` | 登记地块（品种、初始站、播种日） |
+| `POST /api/v1/plots/:id/rebind` | 从某日起改绑到另一个站 |
+| `POST /api/v1/observations/batch` | 批量写观测（≤5000 行，非法行不影响其余，逐条回报原因） |
+| `GET  /api/v1/plots/:id` | 地块、绑定区间、阶段日期/状态 |
+| `GET  /api/v1/plots/:id/days?from=&to=` | 逐日积温曲线（tmax/tmin、日 GDD、累计、来源标记） |
+| `GET  /api/v1/events?after_id=&limit=` | 增量拉取阶段变更事件 |
+
+批量响应每行给出 `ok / applied / kind(insert|correct|replace_fill|supersede_ignored) / reason`。
+
+**非法输入**（逐条/请求级拒绝）：最低温高于最高温、温度超出合理范围 [−70,60] ℃、
+基点不低于上限、阶段积温需求非递增或缺项、播种日期晚于查询日期、改绑到不存在的站、
+未来日期的观测、批次超过 5000 行。
+
+### 示例
+
+```bash
+curl -XPOST localhost:8080/api/v1/varieties -H 'Content-Type: application/json' -d '{
+  "name":"郑单958","base_temp":10,"ceiling_temp":35,
+  "stage_require":{"emergence":40,"jointing":250,"tasseling":600,"silking":900,"maturity":1400}}'
+
+curl -XPOST localhost:8080/api/v1/observations/batch -H 'Content-Type: application/json' -d '{
+ "rows":[
+   {"station_id":1,"date":"2026-05-01","tmax":30,"tmin":14,"seq":1},
+   {"station_id":1,"date":"2026-05-02","tmax": 5,"tmin": 9,"seq":1}
+ ]}'
+# 第 1 行 applied=true，第 2 行 ok=false reason="tmin: tmin is higher than tmax"
+```
+
+## 代码结构（按职责分包）
+
+```
+cmd/server           程序入口（HTTP + worker）
+internal/model       领域类型：日期、品种、地块绑定、观测、阶段、事件
+internal/gdd         日积温三口径（默认正弦截断）及其闭式解
+internal/climate     本站气候平均、邻站海拔/距离加权补值、未来气候外推
+internal/phenology   累计与生育期穿越的纯函数（增量与全量共用）
+internal/events      阶段向量 diff、事件去重
+internal/engine      增量重算：快照选择、逐日走查、事件落库（无 I/O，端口化）
+internal/store       PostgreSQL：schema、入库规则、补值、快照、任务队列
+internal/service     写编排：批量校验、折叠、刷新气候、受影响地块排队、改绑
+internal/worker      持久队列消费、SKIP LOCKED、崩溃恢复、每日推进
+internal/api         Gin 路由与处理器
+internal/validate    全部非法输入规则（单一事实来源）
+```
