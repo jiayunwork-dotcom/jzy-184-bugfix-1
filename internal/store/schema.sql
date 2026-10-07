@@ -148,3 +148,8 @@ CREATE TABLE IF NOT EXISTS recompute_tasks (
 );
 CREATE INDEX IF NOT EXISTS ix_tasks_claim
     ON recompute_tasks(status, run_after, id);
+-- Supports the per-plot ordering gate in Claim so distinct queued changes for
+-- one plot cannot be processed concurrently or out of id order.
+CREATE INDEX IF NOT EXISTS ix_tasks_plot_active
+    ON recompute_tasks(plot_id, id)
+    WHERE status IN ('pending', 'processing');

@@ -117,6 +117,102 @@ func (e *e2e) get(path string) map[string]any {
 
 func idOf(m map[string]any) int64 { return int64(m["id"].(float64)) }
 
+func TestInitialBaselineDoesNotRaceObservationBatch(t *testing.T) {
+	e := newE2E(t)
+	today, _ := model.ParseDate("2026-06-30")
+	e.svc.Now = func() model.Date { return today }
+	e.svc.NowTS = func() time.Time { return time.Date(2026, 6, 30, 12, 0, 0, 0, time.UTC) }
+	ctx := context.Background()
+
+	sowing := model.NewDate(2026, 5, 1)
+	vid, err := e.svc.RegisterVariety(ctx, &model.Variety{
+		Name: fmt.Sprintf("race-v-%d", time.Now().UnixNano()), BaseTemp: 10, CeilingTemp: 30,
+		StageRequire: map[model.Stage]float64{
+			model.StageEmergence: 100,
+			model.StageJointing:  300,
+			model.StageTasseling: 600,
+			model.StageSilking:   700,
+			model.StageMaturity:  1200,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[model.Stage]string{
+		model.StageEmergence: "2026-05-10",
+		model.StageJointing:  "2026-05-28",
+		model.StageTasseling: "2026-06-24",
+	}
+
+	runOne := func(n int, delayBeforeBatch time.Duration) int64 {
+		sid, err := e.svc.RegisterStation(ctx, &model.Station{
+			Code: fmt.Sprintf("race-s-%d-%d", time.Now().UnixNano(), n), Name: "race",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pid, err := e.svc.RegisterPlot(ctx, &model.Plot{
+			Code:      fmt.Sprintf("race-p-%d-%d", time.Now().UnixNano(), n),
+			VarietyID: vid, SowingDate: sowing,
+		}, sid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The initial projection is synchronous and silent; there is no sleep to
+		// let a background initial task finish before the first batch.
+		if delayBeforeBatch != 0 {
+			time.Sleep(delayBeforeBatch)
+		}
+		rows := make([]service.ObservationIn, 0, today.Sub(sowing)+1)
+		for day := sowing; !day.After(today); day = day.AddDays(1) {
+			rows = append(rows, service.ObservationIn{
+				StationID: sid, Date: day.String(), TMax: 28, TMin: 14, Seq: 1,
+			})
+		}
+		res, err := e.svc.IngestObservations(ctx, rows)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Enqueued != 1 {
+			t.Fatalf("scenario %d enqueued %d plots", n, res.Enqueued)
+		}
+		e.waitEmpty()
+		return pid
+	}
+
+	pidFast := runOne(1, 0)
+	pidSlow := runOne(2, 100*time.Millisecond)
+	for _, pid := range []int64{pidFast, pidSlow} {
+		all, err := store.QueryEvents(ctx, e.db, 0, 1000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[model.Stage]model.StageEvent{}
+		for _, ev := range all {
+			if ev.PlotID != pid {
+				continue
+			}
+			if _, exists := got[ev.Stage]; exists {
+				t.Fatalf("plot %d duplicate event for %s", pid, ev.Stage)
+			}
+			got[ev.Stage] = ev
+		}
+		if len(got) != len(want) {
+			t.Fatalf("plot %d got %d events, want %d: %+v", pid, len(got), len(want), got)
+		}
+		for st, day := range want {
+			ev := got[st]
+			if ev.OldDate != nil {
+				t.Fatalf("plot %d %s old=%s, want null", pid, st, ev.OldDate)
+			}
+			if ev.NewDate == nil || ev.NewDate.String() != day {
+				t.Fatalf("plot %d %s new=%v, want %s", pid, st, ev.NewDate, day)
+			}
+		}
+	}
+}
+
 func TestEndToEndHappyPath(t *testing.T) {
 	e := newE2E(t)
 

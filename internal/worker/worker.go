@@ -1,11 +1,14 @@
 // Package worker drains the durable recompute task queue.
 //
 // Tasks are claimed with SELECT ... FOR UPDATE SKIP LOCKED so multiple app
-// replicas never process one task twice. The claimed row is released
-// immediately (rollback of the claim) while the plot recomputation runs in a
-// separate transaction; a crash at any point leaves the task 'pending'
-// (RecoverProcessing resets in-flight rows at startup), and re-running the
-// same task is idempotent thanks to engine snapshots and the event unique key.
+// replicas never process one task twice. The claim query also gates tasks by
+// plot: a newer task waits while an older pending/processing task for the same
+// plot exists, preserving the event history's committed-change order. The
+// claimed row is released immediately (rollback of the claim) while the plot
+// recomputation runs in a separate transaction; a crash at any point leaves the
+// task 'pending' (RecoverProcessing resets in-flight rows at startup), and
+// re-running the same task is idempotent thanks to engine snapshots and the
+// event unique key.
 package worker
 
 import (

@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -160,6 +161,30 @@ func (t *Tx) Rebind(plotID, stationID int64, fromDay model.Date) error {
 	return err
 }
 
+// LockStation locks a station row in the caller's transaction. Write paths use
+// the same parent-row lock order as UpsertObs (station before affected plots),
+// which lets plot registration establish its initial baseline concurrently
+// with observation ingestion without reading an uncommitted/unstable state.
+func (t *Tx) LockStation(id int64) error {
+	_, err := t.tx.Exec(t.ctx, `SELECT id FROM stations WHERE id=$1 FOR UPDATE`, id)
+	return err
+}
+
+// LockPlots locks the supplied plot rows in id order. Write transactions that
+// enqueue recomputes for overlapping plot sets take these in the same fixed
+// order after their station-row locks, which prevents deadlocks and makes
+// committed task-id order match the write order.
+func (t *Tx) LockPlots(ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	sorted := append([]int64(nil), ids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	_, err := t.tx.Exec(t.ctx,
+		`SELECT id FROM plots WHERE id = ANY($1) ORDER BY id FOR UPDATE`, sorted)
+	return err
+}
+
 // PlotsOnStation returns ids of plots bound to stationID in an interval that
 // intersects [sinceDay, +∞).
 func (t *Tx) PlotsOnStation(stationID int64, sinceDay model.Date) ([]int64, error) {
@@ -200,4 +225,3 @@ func (t *Tx) AllPlotIDs() ([]int64, error) {
 	}
 	return ids, rows.Err()
 }
-

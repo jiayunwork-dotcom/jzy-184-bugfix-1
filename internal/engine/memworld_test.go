@@ -419,11 +419,9 @@ func (t memTx) InsertEvent(plotID int64, st model.Stage, old, new *model.Date, r
 	return true, nil
 }
 
-// ---- task queue helpers (used by restart/merge tests) -------------------
+// ---- task queue helpers (used by restart/ordering tests) ----------------
 
-func (w *memWorld) enqueue(k memTask) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
+func (w *memWorld) enqueueLocked(k memTask) {
 	for _, t := range w.tasks {
 		if t.plotID == k.plotID && t.changeID == k.changeID &&
 			(t.status == "pending" || t.status == "processing") {
@@ -436,27 +434,10 @@ func (w *memWorld) enqueue(k memTask) {
 	w.tasks = append(w.tasks, k)
 }
 
-func (w *memWorld) mergeOrEnqueue(k memTask) {
+func (w *memWorld) enqueue(k memTask) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for i := range w.tasks {
-		t := &w.tasks[i]
-		if t.plotID == k.plotID && t.status == "pending" && !t.initial {
-			if k.start.Before(t.start) {
-				t.start = k.start
-			}
-			if k.asOf.After(t.asOf) {
-				t.asOf = k.asOf
-			}
-			t.changeID = k.changeID
-			t.reason += "; " + k.reason
-			return
-		}
-	}
-	w.taskID++
-	k.id = w.taskID
-	k.status = "pending"
-	w.tasks = append(w.tasks, k)
+	w.enqueueLocked(k)
 }
 
 func (w *memWorld) pending() []memTask {

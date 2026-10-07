@@ -1,6 +1,7 @@
 // Package service orchestrates writes: validating batches, applying the
 // largest-seq-wins observation rule, refreshing climatology and imputed rows,
-// and enqueuing durable recompute tasks for every affected plot.
+// establishing the silent initial plot baseline, and enqueuing one durable
+// recompute task for every distinct committed change/affected plot.
 package service
 
 import (
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"time"
 
+	"agriheat/internal/engine"
 	"agriheat/internal/model"
 	"agriheat/internal/store"
 	"agriheat/internal/validate"
@@ -228,8 +230,15 @@ func (s *Service) IngestObservations(ctx context.Context, in []ObservationIn) (*
 		plotIDs = append(plotIDs, id)
 	}
 	sort.Slice(plotIDs, func(i, j int) bool { return plotIDs[i] < plotIDs[j] })
+	// Serialize changes that affect the same plot before inserting tasks. The
+	// transaction already holds changed-station locks; plots are then locked in
+	// id order. Once committed, the durable queue's id order is change order.
+	if err := t.LockPlots(plotIDs); err != nil {
+		return nil, err
+	}
+	// Enqueue one durable task per affected plot for this distinct change.
 	for _, pid := range plotIDs {
-		if err := t.EnqueueOrMergeTask(store.Task{
+		if err := t.EnqueueTask(store.Task{
 			PlotID: pid, AsOf: asOf, Start: plotStart[pid],
 			ChangeID: changeID,
 			Reason:   "batch observation ingest",
@@ -255,22 +264,36 @@ func (s *Service) resolveStation(ctx context.Context, code string) (int64, error
 	return id, nil
 }
 
-// RegisterPlot creates a plot, its initial binding, and enqueues its initial
-// recomputation.
+// RegisterPlot creates a plot and its initial binding, then computes its
+// non-notifying initial baseline in the same transaction.
 func (s *Service) RegisterPlot(ctx context.Context, p *model.Plot, stationID int64) (int64, error) {
 	t, err := s.DB.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer t.Rollback()
+	// Take the ingestion lock before creating the plot and computing its
+	// baseline: reports for this station lock the same parent row first.
+	if err := t.LockStation(stationID); err != nil {
+		return 0, err
+	}
 	id, err := t.CreatePlot(p, stationID)
 	if err != nil {
 		return 0, err
 	}
+	// Establish the registration baseline before the plot becomes visible. The
+	// run is marked initial, so dates calculable from archive observations,
+	// neighbors, or climatology are available immediately but are not treated
+	// as notifications. Doing this synchronously also closes the race where a
+	// report committed immediately after registration could otherwise be folded
+	// into the still-pending initial task and silently lose its events.
 	changeID := fmt.Sprintf("plot:%d:%d", id, s.NowTS().UnixNano())
-	if err := t.EnqueueTask(store.Task{
-		PlotID: id, AsOf: s.Now(), ChangeID: changeID,
-		Reason: "plot registered", IsInitial: true,
+	if _, err := engine.Run(t, engine.Request{
+		PlotID:   id,
+		AsOf:     s.Now(),
+		ChangeID: changeID,
+		Reason:   "plot registered",
+		Initial:  true,
 	}); err != nil {
 		return 0, err
 	}
@@ -312,18 +335,23 @@ func (s *Service) RegisterStation(ctx context.Context, st *model.Station) (int64
 }
 
 // Rebind moves a plot to another station effective fromDay and enqueues a
-// recompute. Re-binding to a nonexistent station fails validation.
+// distinct recompute. Re-binding to a nonexistent station fails validation.
 func (s *Service) Rebind(ctx context.Context, plotID, stationID int64, fromDay model.Date) error {
 	t, err := s.DB.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer t.Rollback()
+	// Serialize against an observation batch that is about to enqueue tasks for
+	// the same plot, then task id order follows commit order.
+	if err := t.LockPlots([]int64{plotID}); err != nil {
+		return err
+	}
 	if err := t.Rebind(plotID, stationID, fromDay); err != nil {
 		return err
 	}
 	changeID := fmt.Sprintf("rebind:%d:%s:%d", plotID, fromDay, s.NowTS().UnixNano())
-	if err := t.EnqueueOrMergeTask(store.Task{
+	if err := t.EnqueueTask(store.Task{
 		PlotID: plotID, AsOf: s.Now(), Start: fromDay, ChangeID: changeID,
 		Reason: fmt.Sprintf("rebind plot to station %d from %s", stationID, fromDay),
 	}); err != nil {

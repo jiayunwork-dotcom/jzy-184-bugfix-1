@@ -43,11 +43,11 @@ func (t *Tx) EnqueueTask(k Task) error {
 	return err
 }
 
-// EnqueueOrMergeTask enqueues k; if the plot already has a not-started pending
-// task, the two are collapsed: earliest start, latest as_of, newest change id.
-// This is what makes two concurrently arriving reports for the same
-// station/day recompute the plot exactly once rather than twice. Initial
-// (first) computations are never merged.
+// EnqueueOrMergeTask is retained for callers that intentionally want the old
+// burst-coalescing behavior. The write paths do not use it: distinct data
+// changes need their own tasks so event vectors do not depend on worker speed.
+// Initial baselines are established synchronously and must never be overwritten
+// by a later change merged into a still-pending initial task.
 func (t *Tx) EnqueueOrMergeTask(k Task) error {
 	if k.IsInitial {
 		return t.EnqueueTask(k)
@@ -62,7 +62,7 @@ func (t *Tx) EnqueueOrMergeTask(k Task) error {
 	var asOf, startDay pgtype.Date
 	err := t.tx.QueryRow(t.ctx, `
 		SELECT id, as_of, start_day FROM recompute_tasks
-		WHERE plot_id=$1 AND status='pending'
+		WHERE plot_id=$1 AND status='pending' AND NOT is_initial
 		  AND (run_after IS NULL OR run_after <= current_date)
 		ORDER BY id LIMIT 1
 		FOR UPDATE`, k.PlotID).Scan(&id, &asOf, &startDay)
@@ -103,10 +103,20 @@ func (db *DB) Claim(ctx context.Context) (*Tx, Task, error) {
 		UPDATE recompute_tasks
 		SET status='processing', started_at=now(), attempts=attempts+1
 		WHERE id = (
-			SELECT id FROM recompute_tasks
-			WHERE status='pending'
-			  AND (run_after IS NULL OR run_after <= current_date)
-			ORDER BY id
+			SELECT id FROM recompute_tasks candidate
+			WHERE candidate.status='pending'
+			  AND (candidate.run_after IS NULL OR candidate.run_after <= current_date)
+			  AND NOT EXISTS (
+			      SELECT 1 FROM recompute_tasks active
+			      WHERE active.plot_id = candidate.plot_id
+			        AND (
+			            active.status='processing'
+			            OR (active.status='pending'
+			                AND (active.run_after IS NULL OR active.run_after <= current_date))
+			        )
+			        AND active.id < candidate.id
+			  )
+			ORDER BY candidate.id
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
 		)

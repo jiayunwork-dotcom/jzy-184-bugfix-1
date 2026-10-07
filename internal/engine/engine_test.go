@@ -418,6 +418,163 @@ func TestSameChangeNoDuplicateEvents(t *testing.T) {
 	}
 }
 
+func TestInitialBaselineSuppressesEventsButDataChangeEmitsThem(t *testing.T) {
+	asOf := d(2026, 6, 30)
+	w := newMemWorld(asOf)
+	w.addStation(1, "S", 30, 120, 50)
+	w.addVariety(1, 10, 30, []float64{100, 300, 600, 700, 1200})
+	sowing := d(2026, 5, 1)
+	w.addPlot(1, 1, 1, sowing)
+
+	// The registration baseline is computed before any data exists: all stages
+	// are unknown. It must remain silent even when forecast inputs are absent.
+	if _, err := engine.Recompute(w.db(), engine.Request{
+		PlotID: 1, AsOf: asOf, ChangeID: "register",
+		Reason: "plot registered", Initial: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.events); n != 0 {
+		t.Fatalf("registration baseline emitted %d events: %+v", n, w.events)
+	}
+
+	// Real data arrives immediately afterward, with no delay between plot
+	// registration and ingest. Every stage moving from unknown to known gets
+	// exactly one event.
+	for day := sowing; !day.After(asOf); day = day.AddDays(1) {
+		w.upsertObs(model.Observation{StationID: 1, Date: day, TMax: 28, TMin: 14, Seq: 1})
+	}
+	if _, err := engine.Recompute(w.db(), engine.Request{
+		PlotID: 1, AsOf: asOf, Start: sowing, ChangeID: "ingest-after-register",
+		Reason: "batch observation ingest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[model.Stage]model.Date{
+		model.StageEmergence: d(2026, 5, 10),
+		model.StageJointing:  d(2026, 5, 28),
+		model.StageTasseling: d(2026, 6, 24),
+	}
+	finalDates := map[model.Stage]model.Date{}
+	for _, st := range model.OrderedStages {
+		if dd := w.stages[1][st].Date; !dd.IsZero() {
+			finalDates[st] = dd
+		}
+	}
+	got := map[model.Stage]memEvent{}
+	for _, e := range w.events {
+		if e.changeID != "ingest-after-register" {
+			t.Fatalf("unexpected event change id %q: %+v", e.changeID, e)
+		}
+		if e.old != nil {
+			t.Fatalf("first data event for %s should have old=null, got %s", e.stage, e.old)
+		}
+		if _, dup := got[e.stage]; dup {
+			t.Fatalf("duplicate event for %s", e.stage)
+		}
+		got[e.stage] = e
+	}
+	// One unknown->known event per stage that now has a date; stages still
+	// unknown must produce nothing.
+	if len(got) != len(finalDates) {
+		t.Fatalf("want %d events, got %d: %+v", len(finalDates), len(got), got)
+	}
+	for st, day := range finalDates {
+		e, ok := got[st]
+		if !ok {
+			t.Fatalf("missing event for %s (date %s)", st, day)
+		}
+		if e.new == nil || !e.new.Equal(day) {
+			t.Fatalf("%s new date = %v, want %s", st, e.new, day)
+		}
+	}
+	for st, day := range want {
+		if got[st].new == nil || !got[st].new.Equal(day) {
+			t.Fatalf("%s new date = %v, want %s", st, got[st].new, day)
+		}
+	}
+}
+
+func TestInitialForecastBaselineOldDatesAreReported(t *testing.T) {
+	asOf := d(2026, 6, 30)
+	w := newMemWorld(asOf)
+	w.addStation(1, "S", 30, 120, 50)
+	w.addVariety(1, 10, 30, []float64{100, 300, 600, 700, 1200})
+	sowing := d(2026, 5, 1)
+	w.addPlot(1, 1, 1, sowing)
+
+	// Cooler climatology supplies forecasts before any current-year report.
+	for day := d(2025, 1, 1); !day.After(d(2025, 12, 31)); day = day.AddDays(1) {
+		w.putObs(model.Observation{StationID: 1, Date: day, TMax: 22, TMin: 12, Seq: 1})
+	}
+	if _, err := engine.Recompute(w.db(), engine.Request{
+		PlotID: 1, AsOf: asOf, Start: sowing, ChangeID: "register",
+		Reason: "plot registered", Initial: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.events); n != 0 {
+		t.Fatalf("forecast baseline emitted %d events: %+v", n, w.events)
+	}
+
+	// Baseline dates are known even though registration emitted nothing.
+	baseline := map[model.Stage]model.Date{}
+	for _, st := range model.OrderedStages {
+		baseline[st] = w.stages[1][st].Date
+		if baseline[st].IsZero() {
+			t.Fatalf("baseline for %s should be forecast from climatology", st)
+		}
+	}
+
+	// Real current-year observations arrive later; every stage moves.
+	for day := sowing; !day.After(asOf); day = day.AddDays(1) {
+		w.putObs(model.Observation{StationID: 1, Date: day, TMax: 28, TMin: 14, Seq: 1})
+	}
+	if _, err := engine.Recompute(w.db(), engine.Request{
+		PlotID: 1, AsOf: asOf, Start: sowing, ChangeID: "real-data",
+		Reason: "batch observation ingest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[model.Stage]memEvent{}
+	for _, e := range w.events {
+		if e.changeID != "real-data" {
+			t.Fatalf("unexpected change id %q", e.changeID)
+		}
+		if _, dup := got[e.stage]; dup {
+			t.Fatalf("duplicate event for %s", e.stage)
+		}
+		got[e.stage] = e
+	}
+	if len(got) != len(model.OrderedStages) {
+		t.Fatalf("want one movement event per stage, got %d: %+v", len(got), got)
+	}
+	for _, st := range model.OrderedStages {
+		e := got[st]
+		wantNew := w.stages[1][st].Date
+		if e.old == nil || !e.old.Equal(baseline[st]) {
+			t.Fatalf("%s event old = %v, want baseline %s", st, e.old, baseline[st])
+		}
+		if e.new == nil || !e.new.Equal(wantNew) || e.new.Equal(*e.old) {
+			t.Fatalf("%s event new = %v, want moved date %s", st, e.new, wantNew)
+		}
+	}
+
+	// The first three crossings come from real observations and must match the
+	// reported example.
+	for st, want := range map[model.Stage]model.Date{
+		model.StageEmergence: d(2026, 5, 10),
+		model.StageJointing:  d(2026, 5, 28),
+		model.StageTasseling: d(2026, 6, 24),
+	} {
+		if !got[st].new.Equal(want) {
+			t.Fatalf("%s new date = %s, want %s", st, got[st].new, want)
+		}
+	}
+}
+
 // TestRandomCorrections is the centerpiece: many random乱序/补传/更正 sequences
 // must leave the incremental engine day-by-day identical to a full recompute
 // from sowing with final data.
@@ -541,7 +698,7 @@ func TestConcurrentReportsKeepLargestSeq(t *testing.T) {
 	}
 }
 
-func TestTaskMergeComputesOnce(t *testing.T) {
+func TestDistinctChangesRemainSeparateTasks(t *testing.T) {
 	asOf := d(2026, 5, 30)
 	w := newMemWorld(asOf)
 	w.addStation(1, "S", 30, 120, 50)
@@ -553,11 +710,13 @@ func TestTaskMergeComputesOnce(t *testing.T) {
 		day := sowing.AddDays(k)
 		w.upsertObs(model.Observation{StationID: 1, Date: day, TMax: 30, TMin: 14, Seq: 1})
 	}
-	// Two batches arrive "concurrently": both enqueue before the worker runs.
-	w.mergeOrEnqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "b1", reason: "batch1"})
-	w.mergeOrEnqueue(memTask{plotID: 1, asOf: asOf, start: sowing.AddDays(10), changeID: "b2", reason: "batch2"})
-	if n := len(w.pending()); n != 1 {
-		t.Fatalf("expected 1 merged pending task, got %d", n)
+	// Two batches arrive before the worker runs. Rows within each batch are one
+	// change, but distinct batches retain separate tasks so a burst cannot
+	// collapse away intermediate events. Both tasks leave the same final answer.
+	w.enqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "b1", reason: "batch1"})
+	w.enqueue(memTask{plotID: 1, asOf: asOf, start: sowing.AddDays(10), changeID: "b2", reason: "batch2"})
+	if n := len(w.pending()); n != 2 {
+		t.Fatalf("expected 2 distinct pending tasks, got %d", n)
 	}
 	if err := w.drain(); err != nil {
 		t.Fatal(err)

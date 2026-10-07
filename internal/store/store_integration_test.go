@@ -109,6 +109,106 @@ func TestClaimSkipsLocked(t *testing.T) {
 	}
 }
 
+// TestClaimPreservesPerPlotOrder ensures a newer task for a plot cannot be
+// claimed while an older task for the same plot is still active; events are a
+// per-plot history and must be applied in committed (id) order.
+func TestClaimPreservesPerPlotOrder(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := tx.CreateStation(&model.Station{Code: "ORD", Name: "o"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vid, err := tx.CreateVariety(&model.Variety{Name: "v", BaseTemp: 10, CeilingTemp: 35,
+		StageRequire: map[model.Stage]float64{
+			model.StageEmergence: 10, model.StageJointing: 30, model.StageTasseling: 60,
+			model.StageSilking: 90, model.StageMaturity: 120,
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p1, err := tx.CreatePlot(&model.Plot{Code: "O1", VarietyID: vid, SowingDate: model.NewDate(2026, 4, 1)}, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := tx.CreatePlot(&model.Plot{Code: "O2", VarietyID: vid, SowingDate: model.NewDate(2026, 4, 1)}, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asOf := model.NewDate(2026, 6, 1)
+	mk := func(plot int64, id string) {
+		if err := tx.EnqueueTask(store.Task{PlotID: plot, AsOf: asOf, ChangeID: id, Reason: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk(p1, "p1-older")
+	mk(p2, "p2-other")
+	mk(p1, "p1-newer")
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Globally oldest task belongs to p1.
+	claim1, task1, err := db.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task1.PlotID != p1 || task1.ChangeID != "p1-older" {
+		t.Fatalf("first claim = plot %d %s", task1.PlotID, task1.ChangeID)
+	}
+
+	// While p1-older is processing, p1-newer must wait even though p2 has a
+	// due task; another plot is still claimable. Commit the claim (status now
+	// 'processing', lock released) just like the worker does before recompute.
+	if err := claim1.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	claim2, task2, err := db.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task2.PlotID != p2 {
+		claim2.Rollback()
+		t.Fatalf("second claim should advance the independent plot, got plot %d %s", task2.PlotID, task2.ChangeID)
+	}
+	if err := claim2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	claim3, task3, err := db.Claim(ctx)
+	if err != nil || claim3 != nil {
+		if claim3 != nil {
+			claim3.Rollback()
+		}
+		t.Fatalf("p1-newer must wait for p1-older, got %+v err=%v", task3, err)
+	}
+
+	// Finish the older p1 task; the newer one becomes claimable.
+	done, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := done.Complete(task1.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := done.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	claim4, task4, err := db.Claim(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer claim4.Rollback()
+	if task4.PlotID != p1 || task4.ChangeID != "p1-newer" {
+		t.Fatalf("final claim = plot %d %s, want p1-newer", task4.PlotID, task4.ChangeID)
+	}
+}
+
 // TestConcurrentSameStationDay applies the same station/day under two
 // concurrent transactions with different seqs; after commit the largest seq
 // must be the single authoritative row.

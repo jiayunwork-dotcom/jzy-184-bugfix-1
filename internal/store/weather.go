@@ -369,4 +369,3 @@ func (t *Tx) EnsureFill(stationID int64, day model.Date) (model.WeatherDay, bool
 	}
 	return w, true, nil
 }
-
