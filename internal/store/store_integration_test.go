@@ -109,6 +109,106 @@ func TestClaimSkipsLocked(t *testing.T) {
 	}
 }
 
+// TestDataChangeNeverMergesIntoInitialTask guards the event-drift fix at the
+// queue level: a data-change task queued while the plot's initial (baseline)
+// task is still pending must NOT be collapsed into it. The old merge could
+// overwrite the initial task's change id while leaving is_initial=true, which
+// silently suppressed the first prediction's events ("register then
+// immediately batch" rhythm).
+func TestDataChangeNeverMergesIntoInitialTask(t *testing.T) {
+	db := openDB(t)
+	ctx := context.Background()
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid, err := tx.CreateStation(&model.Station{Code: "MI", Name: "m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	vid, err := tx.CreateVariety(&model.Variety{Name: "v", BaseTemp: 10, CeilingTemp: 30,
+		StageRequire: map[model.Stage]float64{
+			model.StageEmergence: 100, model.StageJointing: 300, model.StageTasseling: 600,
+			model.StageSilking: 700, model.StageMaturity: 1200,
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := tx.CreatePlot(&model.Plot{Code: "PM", VarietyID: vid, SowingDate: model.NewDate(2026, 5, 1)}, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	day := model.NewDate(2026, 5, 10)
+	if err := tx.EnqueueTask(store.Task{
+		PlotID: pid, AsOf: day, ChangeID: "baseline", Reason: "plot registered", IsInitial: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Data lands before the baseline task was claimed: it must stay separate.
+	if err := tx.EnqueueOrMergeTask(store.Task{
+		PlotID: pid, AsOf: day, Start: model.NewDate(2026, 5, 1),
+		ChangeID: "ingest:1", Reason: "batch observation ingest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := db.Pool.Query(ctx, `
+		SELECT change_id, is_initial FROM recompute_tasks
+		WHERE plot_id=$1 ORDER BY id`, pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	type taskRow struct {
+		changeID string
+		initial  bool
+	}
+	var got []taskRow
+	for rows.Next() {
+		var r taskRow
+		if err := rows.Scan(&r.changeID, &r.initial); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, r)
+	}
+	if len(got) != 2 {
+		t.Fatalf("data change must not merge into the pending initial task; want 2 rows, got %d: %v", len(got), got)
+	}
+	if got[0].changeID != "baseline" || !got[0].initial {
+		t.Fatalf("baseline task altered: %+v", got[0])
+	}
+	if got[1].changeID != "ingest:1" || got[1].initial {
+		t.Fatalf("data change must remain a separate non-initial task: %+v", got[1])
+	}
+
+	// Two ordinary data changes still collapse into one non-initial task.
+	c, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Rollback()
+	if err := c.EnqueueOrMergeTask(store.Task{
+		PlotID: pid, AsOf: day, Start: model.NewDate(2026, 5, 2),
+		ChangeID: "ingest:2", Reason: "second batch",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.Pool.QueryRow(ctx,
+		`SELECT count(*) FROM recompute_tasks WHERE plot_id=$1 AND status='pending'`, pid).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Fatalf("ordinary data changes must still merge; want 2 pending rows, got %d", n)
+	}
+}
+
 // TestConcurrentSameStationDay applies the same station/day under two
 // concurrent transactions with different seqs; after commit the largest seq
 // must be the single authoritative row.

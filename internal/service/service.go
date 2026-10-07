@@ -9,6 +9,7 @@ import (
 	"sort"
 	"time"
 
+	"agriheat/internal/engine"
 	"agriheat/internal/model"
 	"agriheat/internal/store"
 	"agriheat/internal/validate"
@@ -255,8 +256,17 @@ func (s *Service) resolveStation(ctx context.Context, code string) (int64, error
 	return id, nil
 }
 
-// RegisterPlot creates a plot, its initial binding, and enqueues its initial
-// recomputation.
+// RegisterPlot creates a plot and its initial binding, then computes and
+// persists its first stage vector in the SAME transaction. This synchronous
+// "initial baseline" is the boundary for stage events: it never emits events
+// itself, and every later recompute diffs against it.
+//
+// The baseline must be fixed at commit time (not left to an asynchronous task)
+// so events depend only on data changes, not on how fast the worker drains the
+// queue. When a batch lands milliseconds after registration, the baseline is
+// already stored; the batch diff is therefore unknown->date and emits exactly
+// what it would have if the batch had arrived a minute later. See README
+// §初始基线（事件为何不随时序漂移）.
 func (s *Service) RegisterPlot(ctx context.Context, p *model.Plot, stationID int64) (int64, error) {
 	t, err := s.DB.Begin(ctx)
 	if err != nil {
@@ -267,10 +277,15 @@ func (s *Service) RegisterPlot(ctx context.Context, p *model.Plot, stationID int
 	if err != nil {
 		return 0, err
 	}
-	changeID := fmt.Sprintf("plot:%d:%d", id, s.NowTS().UnixNano())
-	if err := t.EnqueueTask(store.Task{
-		PlotID: id, AsOf: s.Now(), ChangeID: changeID,
-		Reason: "plot registered", IsInitial: true,
+	// Compute the baseline from data visible at this instant (observations,
+	// fills, climatology). Initial=true suppresses its events; the stage
+	// vector, curve and checkpoints it writes are the reference every later
+	// change diffs against.
+	if _, err := engine.Run(t, engine.Request{
+		PlotID: id, AsOf: s.Now(),
+		ChangeID: fmt.Sprintf("plot-baseline:%d:%d", id, s.NowTS().UnixNano()),
+		Reason:   "plot registered baseline",
+		Initial:  true,
 	}); err != nil {
 		return 0, err
 	}

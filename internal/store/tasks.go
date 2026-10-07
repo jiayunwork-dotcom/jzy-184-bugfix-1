@@ -47,7 +47,13 @@ func (t *Tx) EnqueueTask(k Task) error {
 // task, the two are collapsed: earliest start, latest as_of, newest change id.
 // This is what makes two concurrently arriving reports for the same
 // station/day recompute the plot exactly once rather than twice. Initial
-// (first) computations are never merged.
+// (first) computations are never merged: neither may an initial task absorb a
+// data change (the change would inherit the initial flag and its events would
+// be suppressed), nor may an initial task be folded into an existing one (it
+// must establish the baseline first). In the current write path plot
+// registration establishes its baseline synchronously (no initial task is
+// enqueued), but this guard keeps the queue correct for any initial task left
+// over from an older binary or enqueued by other paths.
 func (t *Tx) EnqueueOrMergeTask(k Task) error {
 	if k.IsInitial {
 		return t.EnqueueTask(k)
@@ -62,7 +68,7 @@ func (t *Tx) EnqueueOrMergeTask(k Task) error {
 	var asOf, startDay pgtype.Date
 	err := t.tx.QueryRow(t.ctx, `
 		SELECT id, as_of, start_day FROM recompute_tasks
-		WHERE plot_id=$1 AND status='pending'
+		WHERE plot_id=$1 AND status='pending' AND NOT is_initial
 		  AND (run_after IS NULL OR run_after <= current_date)
 		ORDER BY id LIMIT 1
 		FOR UPDATE`, k.PlotID).Scan(&id, &asOf, &startDay)

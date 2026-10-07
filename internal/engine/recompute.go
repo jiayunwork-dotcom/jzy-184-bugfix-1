@@ -144,6 +144,28 @@ func Run(tx Tx, req Request) (*Result, error) {
 	}
 	days := make([]model.PlotDay, 0, req.AsOf.Sub(start)+ForecastHorizon+1)
 
+	// Checkpoint eligibility. A month-end snapshot stores a season-total
+	// cumulative, so it is valid "truth" for a later incremental recompute
+	// only when every day from the start of this walk up to that month-end
+	// carried known data (obs or fill). When the walk begins from a real
+	// snapshot, days before it are not re-walked (snapshot reuse); when it
+	// begins from the synthetic sowing-eve zero it covers the whole season.
+	//
+	// Why this matters: the registration baseline usually runs against a
+	// station with no data yet, so its walked days are tagged missing (0
+	// heat). Persisting month-end checkpoints there would record cum as if
+	// the month truly accumulated nothing; a later recompute reusing such a
+	// checkpoint would skip the very month in which observations then arrived
+	// — the "fast batch" rhythm produced wrong/empty stage dates that way.
+	// spanHasMissing is set by the first missing walked day and is never
+	// reset within the run, withholding that month-end and every later one.
+	spanHasMissing := false
+	markSpan := func(pd model.PlotDay) {
+		if pd.Source == model.SourceMissing || pd.Source == model.SourceUnbound {
+			spanHasMissing = true
+		}
+	}
+
 	dayFn := func(day model.Date) (model.PlotDay, error) {
 		pd := model.PlotDay{Date: day}
 		isFuture := day.After(req.AsOf)
@@ -213,9 +235,16 @@ func Run(tx Tx, req Request) (*Result, error) {
 			crossed[st] = phenology.StageResult{Stage: st, Status: status, Date: day, CumAt: cum}
 			nextStage++
 		}
-		// Checkpoints only on settled past month-ends.
-		if !day.After(req.AsOf) && isMonthEnd(day) {
-			_ = tx.UpsertSnapshot(model.Snapshot{PlotID: plot.ID, Date: day, CumGDD: cum})
+		// Checkpoints only on settled past month-ends, and only while every day
+		// walked so far (back to sowing or the last real checkpoint) carried
+		// known data. Once a missing day has appeared, cum no longer reflects
+		// true accumulated heat and neither this nor any later month-end may be
+		// checkpointed; the flag is deliberately not reset per month.
+		if !day.After(req.AsOf) {
+			markSpan(pd)
+			if isMonthEnd(day) && !spanHasMissing {
+				_ = tx.UpsertSnapshot(model.Snapshot{PlotID: plot.ID, Date: day, CumGDD: cum})
+			}
 		}
 	}
 

@@ -541,6 +541,296 @@ func TestConcurrentReportsKeepLargestSeq(t *testing.T) {
 	}
 }
 
+// loadMayJuneObs inserts the reproduction case: daily 28/14, seq 1, from
+// 2026-05-01 through 2026-06-30 at station 1.
+func loadMayJuneObs(w *memWorld, sowing model.Date) {
+	for day := sowing; !day.After(d(2026, 6, 30)); day = day.AddDays(1) {
+		w.putObs(model.Observation{StationID: 1, Date: day, TMax: 28, TMin: 14, Seq: 1})
+	}
+}
+
+// eventCounts groups a world's events by stage for a given change id.
+func eventCounts(w *memWorld, changeID string) map[model.Stage]int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := map[model.Stage]int{}
+	for _, e := range w.events {
+		if e.changeID == changeID {
+			out[e.stage]++
+		}
+	}
+	return out
+}
+
+// TestEventsIndependentOfIngestTiming reproduces the reported phenomenon:
+// a plot registered against a brand-new empty station, and the whole
+// May-1..Jun-30 batch landing either BEFORE the initial baseline is processed
+// or AFTER it. With the baseline fixed synchronously at registration, both
+// rhythms must produce the SAME events (and dates must match the reported
+// ones: emergence 05-10, jointing 05-28, tasseling 06-24).
+func TestEventsIndependentOfIngestTiming(t *testing.T) {
+	asOf := d(2026, 6, 30)
+	sowing := d(2026, 5, 1)
+	newWorld := func() *memWorld {
+		w := newMemWorld(asOf)
+		w.addStation(1, "S", 30, 120, 50)
+		w.addVariety(1, 10, 30, []float64{100, 300, 600, 700, 1200})
+		w.addPlot(1, 1, 1, sowing)
+		return w
+	}
+	runRhythm := func(tag string, fast bool) *memWorld {
+		w := newWorld()
+		if fast {
+			// "Register and immediately batch": registration establishes the
+			// baseline synchronously (against data visible at that instant),
+			// before any observation exists.
+			w.enqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "baseline", initial: true})
+			if err := w.drain(); err != nil {
+				t.Fatal(err)
+			}
+			loadMayJuneObs(w, sowing)
+			w.mergeOrEnqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "batch", reason: "batch observation ingest"})
+			if err := w.drain(); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			// "Register, wait, then batch": same ordering, split in time.
+			w.enqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "baseline", initial: true})
+			if err := w.drain(); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(2 * time.Millisecond)
+			loadMayJuneObs(w, sowing)
+			w.mergeOrEnqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "batch", reason: "batch observation ingest"})
+			if err := w.drain(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return w
+	}
+
+	wFast := runRhythm("fast", true)
+	wSlow := runRhythm("slow", false)
+
+	// Both rhythms: baseline produced no events; the batch produced one event
+	// per dated stage. The batch's own observations populate the station's
+	// day-of-year climatology, so the future projection also dates silking and
+	// maturity (as the reported reproduction states).
+	cFast := eventCounts(wFast, "batch")
+	cSlow := eventCounts(wSlow, "batch")
+	if len(cFast) != len(cSlow) {
+		t.Fatalf("event counts differ by timing: fast=%v slow=%v", cFast, cSlow)
+	}
+	for st, n := range cFast {
+		if n != 1 || cSlow[st] != 1 {
+			t.Fatalf("stage %s not exactly one event in both rhythms: fast=%d slow=%d", st, n, cSlow[st])
+		}
+	}
+	if n := len(eventCounts(wFast, "baseline")) + len(eventCounts(wSlow, "baseline")); n != 0 {
+		t.Fatalf("registration baseline must never emit events, got %d", n)
+	}
+	if len(cFast) != 5 {
+		t.Fatalf("want one event for each of the five stages, got %v", cFast)
+	}
+	// Reached dates match the reported reproduction and every old date must be
+	// empty (the first prediction).
+	wantDates := map[model.Stage]model.Date{
+		model.StageEmergence: d(2026, 5, 10),
+		model.StageJointing:  d(2026, 5, 28),
+		model.StageTasseling: d(2026, 6, 24),
+	}
+	for _, w := range []*memWorld{wFast, wSlow} {
+		w.mu.Lock()
+		gotNew := map[model.Stage]model.Date{}
+		for _, e := range w.events {
+			if e.changeID != "batch" {
+				continue
+			}
+			if e.old != nil {
+				t.Fatalf("first data change for %s must have empty old date, got %s", e.stage, e.old)
+			}
+			if e.new == nil || e.new.IsZero() {
+				t.Fatalf("%s event must carry a new date", e.stage)
+			}
+			gotNew[e.stage] = *e.new
+			if wd, ok := wantDates[e.stage]; ok && !e.new.Equal(wd) {
+				t.Fatalf("%s new date = %s, want %s", e.stage, e.new, wd)
+			}
+		}
+		for st := range wantDates {
+			if _, ok := gotNew[st]; !ok {
+				t.Fatalf("missing event for %s in rhythm", st)
+			}
+		}
+		w.mu.Unlock()
+	}
+}
+
+// TestDelayedBaselineSwallowingDataDocumentsBug pins down why the baseline
+// cannot be left to the asynchronous queue: when an initial task is only
+// processed AFTER the data arrived (the old "register then immediately batch,
+// worker fast" path) it swallows the first prediction silently. The fixed
+// write path runs the baseline inside the registration transaction, so this
+// ordering cannot occur; this test documents the failure mode and guards
+// against reintroducing it.
+func TestDelayedBaselineSwallowingDataDocumentsBug(t *testing.T) {
+	asOf := d(2026, 6, 30)
+	sowing := d(2026, 5, 1)
+	w := newMemWorld(asOf)
+	w.addStation(1, "S", 30, 120, 50)
+	w.addVariety(1, 10, 30, []float64{100, 300, 600, 700, 1200})
+	w.addPlot(1, 1, 1, sowing)
+
+	// Initial task queued, data lands before the worker drains it.
+	w.enqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "baseline", initial: true})
+	loadMayJuneObs(w, sowing)
+	if err := w.drain(); err != nil {
+		t.Fatal(err)
+	}
+	// Dates exist (the farmer can query them) ...
+	st := w.stages[1][model.StageEmergence]
+	if st.Date.IsZero() {
+		t.Fatal("expected emergence date to be computed")
+	}
+	// ... but zero events were ever emitted: the mini program never learns it.
+	if len(w.events) != 0 {
+		t.Fatalf("delayed initial run must be the documented silent-swallow case; got events %+v", w.events)
+	}
+
+	// The guard contract: a data-change task queued while an initial task is
+	// still pending must NOT merge into it (which would inherit Initial=true).
+	w.enqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "baseline2", initial: true})
+	w.mergeOrEnqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "batch2", reason: "x"})
+	if n := len(w.pending()); n != 2 {
+		t.Fatalf("data change must not merge into a pending initial task; want 2 pending, got %d", n)
+	}
+}
+
+// TestRegistrationBaselineWithClimateThenRealData proves requirement: a plot
+// whose dates are ALREADY predictable at registration (same-station
+// climatology from archive years) emits no registration events; when real
+// observations later move those dates, every movement is recorded with the
+// old (registration-time) and new date.
+func TestRegistrationBaselineWithClimateThenRealData(t *testing.T) {
+	asOf := d(2026, 6, 30)
+	sowing := d(2026, 5, 1)
+	w := newMemWorld(asOf)
+	w.addStation(1, "S", 30, 120, 50)
+	w.addVariety(1, 10, 30, []float64{100, 300, 600, 700, 1200})
+	// Archive: five prior years of 26/14 -> 10 GDD/day climatology.
+	for yr := 2021; yr <= 2025; yr++ {
+		for k := 0; k < 365; k++ {
+			w.putObs(model.Observation{StationID: 1, Date: d(yr, 1, 1).AddDays(k), TMax: 26, TMin: 14, Seq: 1})
+		}
+	}
+	w.addPlot(1, 1, 1, sowing)
+	// Registration baseline with no current-year obs: all five dates are
+	// predictable, but registration emits nothing.
+	w.enqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "baseline", initial: true})
+	if err := w.drain(); err != nil {
+		t.Fatal(err)
+	}
+	if len(w.events) != 0 {
+		t.Fatalf("registration with predictable dates must not emit events: %+v", w.events)
+	}
+	baseline := map[model.Stage]model.Date{}
+	for st, s := range w.stages[1] {
+		if s.Date.IsZero() {
+			t.Fatalf("baseline stage %s should be predictable from climatology", st)
+		}
+		baseline[st] = s.Date
+	}
+
+	// Real 28/14 observations (11 GDD/day) replace the fills and move four
+	// dates earlier. Emergence needs ceil(100/g) days: 10 at either rate, so
+	// it stays on 05-10 and emits nothing.
+	loadMayJuneObs(w, sowing)
+	w.mergeOrEnqueue(memTask{plotID: 1, asOf: asOf, start: sowing, changeID: "real", reason: "real observations"})
+	if err := w.drain(); err != nil {
+		t.Fatal(err)
+	}
+	counts := eventCounts(w, "real")
+	if len(counts) != 4 {
+		t.Fatalf("want 4 moved stages (emergence unchanged), got %v", counts)
+	}
+	for st, n := range counts {
+		if n != 1 {
+			t.Fatalf("stage %s emitted %d events, want 1", st, n)
+		}
+	}
+	for _, e := range w.events {
+		if e.changeID != "real" {
+			continue
+		}
+		if e.old == nil || !e.old.Equal(baseline[e.stage]) {
+			t.Fatalf("%s event old date %v must equal baseline %s", e.stage, e.old, baseline[e.stage])
+		}
+		if e.new == nil || !e.new.Before(*e.old) {
+			t.Fatalf("%s warmer observations must move date earlier: %s -> %v", e.stage, e.old, e.new)
+		}
+	}
+	if counts[model.StageEmergence] != 0 {
+		t.Fatal("unchanged emergence date must not produce an event")
+	}
+	if got := w.stages[1][model.StageEmergence].Date; !got.Equal(d(2026, 5, 10)) {
+		t.Fatalf("emergence = %s, want 2026-05-10", got)
+	}
+	assertEqOracle(t, w, 1, asOf, "baseline then real")
+}
+
+// TestEmptyBaselineDoesNotPoisonCheckpoints guards the snapshot mechanism
+// behind the timing fix: a registration-time baseline computed against a
+// station WITHOUT data must NOT persist month-end checkpoints recording
+// cum=0. If it did, a subsequent recompute (batch merged before the worker ran)
+// would reuse the poisoned checkpoint, skip the month the data arrived in, and
+// produce wrong stage dates. After the data lands and is recomputed, stages
+// must equal the full oracle and valid snapshots must exist.
+func TestEmptyBaselineDoesNotPoisonCheckpoints(t *testing.T) {
+	asOf := d(2026, 6, 30)
+	sowing := d(2026, 5, 1)
+	w := newMemWorld(asOf)
+	w.addStation(1, "S", 30, 120, 50)
+	w.addVariety(1, 10, 30, []float64{100, 300, 600, 700, 1200})
+	w.addPlot(1, 1, 1, sowing)
+
+	// Baseline with no observations at all: every past day is missing.
+	if _, err := engine.Recompute(w.db(), engine.Request{
+		PlotID: 1, AsOf: asOf, Start: sowing, ChangeID: "baseline", Initial: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(w.snapshots[1]); n != 0 {
+		t.Fatalf("data-less baseline must write no month-end snapshots, got %d: %v", n, w.snapshots[1])
+	}
+	if n := len(w.events); n != 0 {
+		t.Fatalf("baseline must emit no events, got %d", n)
+	}
+
+	// Data for the whole window then arrives in one change. The recompute must
+	// start from sowing (no poisoned May-31 checkpoint) and date every stage.
+	loadMayJuneObs(w, sowing)
+	if _, err := engine.Recompute(w.db(), engine.Request{
+		PlotID: 1, AsOf: asOf, Start: sowing, ChangeID: "batch", Reason: "batch observation ingest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.stages[1][model.StageEmergence].Date; !got.Equal(d(2026, 5, 10)) {
+		t.Fatalf("emergence = %s, want 2026-05-10 (poisoned snapshot?)", got)
+	}
+	if got := w.stages[1][model.StageJointing].Date; !got.Equal(d(2026, 5, 28)) {
+		t.Fatalf("jointing = %s, want 2026-05-28", got)
+	}
+	if got := w.stages[1][model.StageTasseling].Date; !got.Equal(d(2026, 6, 24)) {
+		t.Fatalf("tasseling = %s, want 2026-06-24", got)
+	}
+	// Now that every walked day was known, the settled May month-end snapshot
+	// must have been written with the true cumulative (31 days * 11 GDD).
+	if got := w.snapshots[1][d(2026, 5, 31)]; math.Abs(got-341) > 1e-9 {
+		t.Fatalf("may snapshot cum = %v, want 341", got)
+	}
+	assertEqOracle(t, w, 1, asOf, "batch after empty baseline")
+}
+
 func TestTaskMergeComputesOnce(t *testing.T) {
 	asOf := d(2026, 5, 30)
 	w := newMemWorld(asOf)

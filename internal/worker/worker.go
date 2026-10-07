@@ -26,6 +26,9 @@ type Worker struct {
 	DB     *store.DB
 	Engine engine.DB
 	Poll   time.Duration
+	// Today yields the current calendar date. It is injectable so tests can run
+	// the worker against a frozen clock; production uses model.Today.
+	Today func() model.Date
 }
 
 // New builds a worker over db.
@@ -33,7 +36,7 @@ func New(db *store.DB, poll time.Duration) *Worker {
 	if poll == 0 {
 		poll = 200 * time.Millisecond
 	}
-	return &Worker{DB: db, Engine: db, Poll: poll}
+	return &Worker{DB: db, Engine: db, Poll: poll, Today: model.Today}
 }
 
 // Run blocks until ctx is cancelled.
@@ -41,21 +44,21 @@ func (w *Worker) Run(ctx context.Context) {
 	if err := w.DB.RecoverProcessing(ctx); err != nil {
 		log.Printf("worker: recover processing: %v", err)
 	}
-	w.rollForward(ctx) // once at startup (deduped by change id)
+	w.rollForward(ctx, w.Today()) // once at startup (deduped by change id)
 
 	ticker := time.NewTicker(w.Poll)
 	defer ticker.Stop()
 	dayTicker := time.NewTicker(time.Hour)
 	defer dayTicker.Stop()
-	lastDay := model.Today()
+	lastDay := w.Today()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-dayTicker.C:
-			if today := model.Today(); today != lastDay {
+			if today := w.Today(); today != lastDay {
 				lastDay = today
-				w.rollForward(ctx)
+				w.rollForward(ctx, today)
 			}
 		default:
 		}
@@ -80,8 +83,8 @@ func (w *Worker) Run(ctx context.Context) {
 }
 
 // rollForward enqueues the daily projection advance for every plot.
-func (w *Worker) rollForward(ctx context.Context) {
-	if n, err := w.DB.EnqueueRollforward(ctx, model.Today()); err != nil {
+func (w *Worker) rollForward(ctx context.Context, today model.Date) {
+	if n, err := w.DB.EnqueueRollforward(ctx, today); err != nil {
 		log.Printf("worker: rollforward enqueue: %v", err)
 	} else if n > 0 {
 		log.Printf("worker: enqueued %d daily roll-forward tasks", n)
